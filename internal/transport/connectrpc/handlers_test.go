@@ -67,7 +67,7 @@ func validSubmission() *orderpb.LimitOrderSubmission {
 
 func principalContext(t *testing.T) context.Context {
 	t.Helper()
-	ctx, err := auth.WithPrincipal(context.Background(), auth.Principal{AccountID: "account-42"})
+	ctx, err := auth.WithPrincipal(context.Background(), auth.Principal{AccountID: "account-42", Permissions: []auth.Permission{auth.OrdersRead, auth.OrdersWrite}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,11 @@ func TestTradingRejectsMissingPrincipalAndInvalidOrder(t *testing.T) {
 }
 
 func TestTradingForwardsIdentityAndActualStatus(t *testing.T) {
-	fake := &fakeOrders{response: &privatepb.SubmitLimitOrderResponse{Order: &orderpb.LimitOrder{OrderId: "123", Status: orderpb.OrderStatus_ORDER_STATUS_OPEN}}}
+	fake := &fakeOrders{response: &privatepb.SubmitLimitOrderResponse{Order: &orderpb.LimitOrder{
+		OrderId: "123", AccountId: "account-42", ClientOrderId: "client-1", MarketId: "BTC-USDT",
+		Side: orderpb.OrderSide_ORDER_SIDE_BUY, TimeInForce: orderpb.TimeInForce_TIME_IN_FORCE_GTC,
+		Status: orderpb.OrderStatus_ORDER_STATUS_OPEN,
+	}}}
 	h := NewTradingHandler(fake)
 	msg := connect.NewRequest(&publicpb.SubmitLimitOrderRequest{Order: validSubmission()})
 	res, err := h.SubmitLimitOrder(principalContext(t), msg)
@@ -120,7 +124,9 @@ func TestTradingSanitizesAndRejectsMalformedUpstream(t *testing.T) {
 	if connect.CodeOf(err) != connect.CodeUnavailable {
 		t.Fatalf("malformed response: %v", err)
 	}
-	fake.response.Order = &orderpb.LimitOrder{OrderId: "123", Status: orderpb.OrderStatus_ORDER_STATUS_UNSPECIFIED}
+	fake.response.Order = &orderpb.LimitOrder{OrderId: "123", AccountId: "account-42", ClientOrderId: "client-1", MarketId: "BTC-USDT",
+		Side: orderpb.OrderSide_ORDER_SIDE_BUY, TimeInForce: orderpb.TimeInForce_TIME_IN_FORCE_GTC,
+		Status: orderpb.OrderStatus_ORDER_STATUS_UNSPECIFIED}
 	_, err = h.SubmitLimitOrder(principalContext(t), msg)
 	if connect.CodeOf(err) != connect.CodeUnavailable {
 		t.Fatalf("unspecified status: %v", err)
@@ -398,5 +404,100 @@ func TestExplicitPublicStatusMappings(t *testing.T) {
 	}
 	if _, ok := publicOrderStatus(privatepb.PrivateOrderStatus_PRIVATE_ORDER_STATUS_UNSPECIFIED); ok {
 		t.Fatal("unknown order state accepted")
+	}
+}
+
+// A private backend returning another account's order must never cross the
+// public tenant boundary, even if it is otherwise a successful RPC.
+func TestSubmitRejectsMismatchedPrivateResponse(t *testing.T) {
+	response := &privatepb.SubmitLimitOrderResponse{Order: &orderpb.LimitOrder{
+		OrderId: "123", AccountId: "account-42", ClientOrderId: "client-1", MarketId: "BTC-USDT",
+		Side: orderpb.OrderSide_ORDER_SIDE_BUY, TimeInForce: orderpb.TimeInForce_TIME_IN_FORCE_GTC,
+		Status: orderpb.OrderStatus_ORDER_STATUS_ACCEPTED,
+	}}
+	f := &fakeOrders{response: response}
+	h := NewTradingHandler(f)
+	request := connect.NewRequest(&publicpb.SubmitLimitOrderRequest{Order: validSubmission()})
+	check := func(reason string) {
+		t.Helper()
+		if _, err := h.SubmitLimitOrder(principalContext(t), request); connect.CodeOf(err) != connect.CodeUnavailable {
+			t.Fatalf("%s: expected sanitized unavailable; got %v", reason, err)
+		}
+	}
+	response.Order.AccountId = "someone-else"
+	check("wrong account")
+	response.Order.AccountId = "account-42"
+	response.Order.ClientOrderId = "another-client-order"
+	check("wrong client order ID")
+	response.Order.ClientOrderId = "client-1"
+	response.Order.MarketId = "ETH-USDT"
+	check("wrong market")
+	response.Order.MarketId = "BTC-USDT"
+	response.Order.Side = orderpb.OrderSide_ORDER_SIDE_SELL
+	check("wrong side")
+	response.Order.Side = orderpb.OrderSide_ORDER_SIDE_BUY
+	response.Order.TimeInForce = orderpb.TimeInForce_TIME_IN_FORCE_UNSPECIFIED
+	check("wrong TIF")
+	response.Order.TimeInForce = orderpb.TimeInForce_TIME_IN_FORCE_GTC
+	response.Order.OrderId = "99999999999999999999"
+	check("non-canonical order ID")
+	response.Order.OrderId = "123"
+	response.Order.Status = orderpb.OrderStatus(999)
+	check("unknown status")
+}
+
+func TestTradingHandlerEnforcesPermissionsWithoutRouter(t *testing.T) {
+	f := &fakeOrders{}
+	h := NewTradingHandler(f)
+	contextFor := func(perms ...auth.Permission) context.Context {
+		t.Helper()
+		ctx, err := auth.WithPrincipal(context.Background(), auth.Principal{AccountID: "account-42", Permissions: perms})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ctx
+	}
+	writeOnly := contextFor(auth.OrdersWrite)
+	readOnly := contextFor(auth.OrdersRead)
+	if _, err := h.SubmitLimitOrder(readOnly, connect.NewRequest(&publicpb.SubmitLimitOrderRequest{Order: validSubmission()})); connect.CodeOf(err) != connect.CodePermissionDenied {
+		t.Fatalf("read-only principal could submit: %v", err)
+	}
+	if _, err := h.CancelOrder(readOnly, connect.NewRequest(&publicpb.CancelOrderRequest{OrderId: "42"})); connect.CodeOf(err) != connect.CodePermissionDenied {
+		t.Fatalf("read-only principal could cancel: %v", err)
+	}
+	if _, err := h.GetOrder(writeOnly, connect.NewRequest(&publicpb.GetOrderRequest{OrderId: "42"})); connect.CodeOf(err) != connect.CodePermissionDenied {
+		t.Fatalf("write-only principal could read: %v", err)
+	}
+	if _, err := h.GetOpenOrders(writeOnly, connect.NewRequest(&publicpb.GetOpenOrdersRequest{})); connect.CodeOf(err) != connect.CodePermissionDenied {
+		t.Fatalf("write-only principal could list: %v", err)
+	}
+	if f.calls != 0 || f.cancelCalls != 0 || f.getCalls != 0 || f.listCalls != 0 {
+		t.Fatal("unauthorized private call reached upstream")
+	}
+}
+
+func TestCancelRejectsUnknownPrivateLifecycle(t *testing.T) {
+	f := &fakeOrders{cancelResponse: &privatepb.CancelOrderResponse{
+		OrderId: "42", Status: privatepb.CancelRequestStatus_CANCEL_REQUEST_STATUS_PENDING,
+		LifecycleStatus: orderpb.OrderStatus(999),
+	}}
+	_, err := NewTradingHandler(f).CancelOrder(principalContext(t), connect.NewRequest(&publicpb.CancelOrderRequest{OrderId: "42"}))
+	if connect.CodeOf(err) != connect.CodeUnavailable {
+		t.Fatalf("unknown backend lifecycle accepted: %v", err)
+	}
+}
+
+func TestSubmitPreservesDurableAcceptedWithoutInventingExecution(t *testing.T) {
+	f := &fakeOrders{response: &privatepb.SubmitLimitOrderResponse{Order: &orderpb.LimitOrder{
+		OrderId: "123", AccountId: "account-42", ClientOrderId: "client-1", MarketId: "BTC-USDT",
+		Side: orderpb.OrderSide_ORDER_SIDE_BUY, TimeInForce: orderpb.TimeInForce_TIME_IN_FORCE_GTC,
+		Status: orderpb.OrderStatus_ORDER_STATUS_ACCEPTED,
+	}}}
+	res, err := NewTradingHandler(f).SubmitLimitOrder(principalContext(t), connect.NewRequest(&publicpb.SubmitLimitOrderRequest{Order: validSubmission()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Msg.GetStatus() != orderpb.OrderStatus_ORDER_STATUS_ACCEPTED {
+		t.Fatalf("gateway invented a later execution state: %v", res.Msg.GetStatus())
 	}
 }

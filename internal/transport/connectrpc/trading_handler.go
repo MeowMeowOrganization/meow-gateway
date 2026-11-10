@@ -9,7 +9,6 @@ import (
 	"connectrpc.com/connect"
 	publicpb "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/api/v1alpha1"
 	"github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/api/v1alpha1/apiv1alpha1connect"
-	orderpb "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/order/v1alpha1"
 	privatepb "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/private/order/v1alpha1"
 	"github.com/MeowMeowOrganization/meow-gateway/internal/auth"
 	"github.com/MeowMeowOrganization/meow-gateway/internal/edgeerrors"
@@ -33,10 +32,15 @@ func NewTradingHandler(orders OrderSubmitter) *TradingHandler {
 	return &TradingHandler{orders: orders}
 }
 
-func verifiedAccount(ctx context.Context) (string, error) {
+func verifiedAccount(ctx context.Context, required auth.Permission) (string, error) {
 	principal, ok := auth.PrincipalFromContext(ctx)
 	if !ok || principal.AccountID == "" {
 		return "", edgeerrors.ToConnect(edgeerrors.New(edgeerrors.Unauthenticated, auth.ErrInvalidCredentials))
+	}
+	// Defense in depth: the HTTP router also enforces the permission table,
+	// but individual handlers must remain fail-closed if routing changes.
+	if !principal.HasPermission(required) {
+		return "", edgeerrors.ToConnect(edgeerrors.New(edgeerrors.PermissionDenied, nil))
 	}
 	return principal.AccountID, nil
 }
@@ -50,7 +54,7 @@ func malformedBackend() error {
 }
 
 func (h *TradingHandler) SubmitLimitOrder(ctx context.Context, req *connect.Request[publicpb.SubmitLimitOrderRequest]) (*connect.Response[publicpb.SubmitLimitOrderResponse], error) {
-	accountID, err := verifiedAccount(ctx)
+	accountID, err := verifiedAccount(ctx, auth.OrdersWrite)
 	if err != nil {
 		return nil, err
 	}
@@ -71,12 +75,22 @@ func (h *TradingHandler) SubmitLimitOrder(ctx context.Context, req *connect.Requ
 	if err != nil {
 		return nil, edgeerrors.ToConnect(err)
 	}
-	if res == nil || res.Order == nil || res.Order.GetOrderId() == "" ||
-		res.Order.GetStatus() == orderpb.OrderStatus_ORDER_STATUS_UNSPECIFIED {
+	// The response is private and must be checked before projecting anything.
+	// An upstream bug must not disclose another account's order ID or status.
+	if res == nil || res.Order == nil ||
+		validation.OrderID(res.Order.GetOrderId()) != nil ||
+		res.Order.GetAccountId() != accountID ||
+		res.Order.GetClientOrderId() != req.Msg.GetOrder().GetClientOrderId() ||
+		res.Order.GetMarketId() != req.Msg.GetOrder().GetMarketId() ||
+		res.Order.GetSide() != req.Msg.GetOrder().GetSide() ||
+		res.Order.GetTimeInForce() != req.Msg.GetOrder().GetTimeInForce() ||
+		!validSubmissionStatus(res.Order.GetStatus()) {
 		return nil, malformedBackend()
 	}
-	// The public submit enum cannot represent ADMISSION_PENDING. Never invent
-	// an ACCEPTED status when the private admission is still pending.
+	// Success means the Order Service returned its authoritative result.
+	// Do not upgrade ACCEPTED into OPEN or FILLED. This legacy private reply
+	// cannot represent ADMISSION_PENDING; the Order Service must not return it
+	// until durable admission is complete (see docs/CEX22.md).
 	return connect.NewResponse(&publicpb.SubmitLimitOrderResponse{
 		OrderId: res.Order.GetOrderId(),
 		Status:  res.Order.GetStatus(),
@@ -84,7 +98,7 @@ func (h *TradingHandler) SubmitLimitOrder(ctx context.Context, req *connect.Requ
 }
 
 func (h *TradingHandler) CancelOrder(ctx context.Context, req *connect.Request[publicpb.CancelOrderRequest]) (*connect.Response[publicpb.CancelOrderResponse], error) {
-	accountID, err := verifiedAccount(ctx)
+	accountID, err := verifiedAccount(ctx, auth.OrdersWrite)
 	if err != nil {
 		return nil, err
 	}
@@ -108,7 +122,8 @@ func (h *TradingHandler) CancelOrder(ctx context.Context, req *connect.Request[p
 		return nil, malformedBackend()
 	}
 	status, ok := publicCancelStatus(res.GetStatus())
-	if !ok || status == publicpb.CancelRequestStatus_CANCEL_REQUEST_STATUS_UNSPECIFIED {
+	if !ok || status == publicpb.CancelRequestStatus_CANCEL_REQUEST_STATUS_UNSPECIFIED ||
+		!validLifecycleStatus(res.GetLifecycleStatus()) {
 		return nil, malformedBackend()
 	}
 	// PENDING means an enqueued cancel intent; it is not confirmation.
@@ -121,7 +136,7 @@ func (h *TradingHandler) CancelOrder(ctx context.Context, req *connect.Request[p
 }
 
 func (h *TradingHandler) GetOrder(ctx context.Context, req *connect.Request[publicpb.GetOrderRequest]) (*connect.Response[publicpb.GetOrderResponse], error) {
-	accountID, err := verifiedAccount(ctx)
+	accountID, err := verifiedAccount(ctx, auth.OrdersRead)
 	if err != nil {
 		return nil, err
 	}
@@ -152,7 +167,7 @@ func (h *TradingHandler) GetOrder(ctx context.Context, req *connect.Request[publ
 }
 
 func (h *TradingHandler) GetOpenOrders(ctx context.Context, req *connect.Request[publicpb.GetOpenOrdersRequest]) (*connect.Response[publicpb.GetOpenOrdersResponse], error) {
-	accountID, err := verifiedAccount(ctx)
+	accountID, err := verifiedAccount(ctx, auth.OrdersRead)
 	if err != nil {
 		return nil, err
 	}

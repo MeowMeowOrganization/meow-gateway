@@ -4,11 +4,33 @@ import (
 	"errors"
 
 	publicpb "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/api/v1alpha1"
+	orderpb "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/order/v1alpha1"
 	privatepb "github.com/MeowMeowOrganization/meow-contracts/gen/go/meow/exchange/private/order/v1alpha1"
 	"github.com/MeowMeowOrganization/meow-gateway/internal/validation"
 )
 
 var errInvalidProjection = errors.New("invalid private order projection")
+
+// Explicitly allowlisted lifecycle states. Unknown protobuf enum numbers are
+// legal on the wire; they are not meaningful public trading states.
+func validLifecycleStatus(status orderpb.OrderStatus) bool {
+	switch status {
+	case orderpb.OrderStatus_ORDER_STATUS_UNSPECIFIED,
+		orderpb.OrderStatus_ORDER_STATUS_ACCEPTED,
+		orderpb.OrderStatus_ORDER_STATUS_OPEN,
+		orderpb.OrderStatus_ORDER_STATUS_PARTIALLY_FILLED,
+		orderpb.OrderStatus_ORDER_STATUS_FILLED,
+		orderpb.OrderStatus_ORDER_STATUS_REJECTED,
+		orderpb.OrderStatus_ORDER_STATUS_CANCELED:
+		return true
+	default:
+		return false
+	}
+}
+
+func validSubmissionStatus(status orderpb.OrderStatus) bool {
+	return status != orderpb.OrderStatus_ORDER_STATUS_UNSPECIFIED && validLifecycleStatus(status)
+}
 
 // publicCancelStatus uses an explicit exhaustive mapping; never rely on enum
 // integer alignment between private and public protobuf packages.

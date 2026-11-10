@@ -52,7 +52,9 @@ func (f *privateOrdersFake) SubmitLimitOrder(ctx context.Context, req *connect.R
 	f.account = req.Msg.GetAccountId()
 	f.requestID = req.Header().Get("X-Request-ID")
 	f.authorization = req.Header().Get("Authorization")
-	return connect.NewResponse(&privatepb.SubmitLimitOrderResponse{Order: &orderpb.LimitOrder{OrderId: "77", Status: orderpb.OrderStatus_ORDER_STATUS_OPEN}}), nil
+	return connect.NewResponse(&privatepb.SubmitLimitOrderResponse{Order: &orderpb.LimitOrder{OrderId: "77", AccountId: req.Msg.GetAccountId(), ClientOrderId: req.Msg.GetOrder().GetClientOrderId(),
+		MarketId: req.Msg.GetOrder().GetMarketId(), Side: req.Msg.GetOrder().GetSide(), TimeInForce: req.Msg.GetOrder().GetTimeInForce(),
+		Status: orderpb.OrderStatus_ORDER_STATUS_OPEN}}), nil
 }
 
 func (f *privateOrdersFake) CancelOrder(_ context.Context, req *connect.Request[privatepb.CancelOrderRequest]) (*connect.Response[privatepb.CancelOrderResponse], error) {

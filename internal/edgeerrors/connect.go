@@ -34,6 +34,8 @@ func toPublicConnect(code connect.Code) error {
 		c = NotFound
 	case connect.CodeAlreadyExists:
 		c = AlreadyExists
+	case connect.CodeAborted:
+		c = Aborted
 	case connect.CodeFailedPrecondition:
 		c = FailedPrecondition
 	case connect.CodeResourceExhausted:
@@ -65,6 +67,8 @@ func codeFor(code Code) connect.Code {
 		return connect.CodeNotFound
 	case AlreadyExists:
 		return connect.CodeAlreadyExists
+	case Aborted:
+		return connect.CodeAborted
 	case FailedPrecondition:
 		return connect.CodeFailedPrecondition
 	case ResourceExhausted:

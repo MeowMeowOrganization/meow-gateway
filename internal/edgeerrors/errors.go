@@ -18,6 +18,7 @@ const (
 	PermissionDenied   Code = "permission_denied"
 	NotFound           Code = "not_found"
 	AlreadyExists      Code = "already_exists"
+	Aborted            Code = "aborted"
 	FailedPrecondition Code = "failed_precondition"
 	ResourceExhausted  Code = "resource_exhausted"
 	Unavailable        Code = "unavailable"
@@ -93,6 +94,8 @@ func public(code Code) Public {
 		return Public{code, "resource not found", http.StatusNotFound}
 	case AlreadyExists:
 		return Public{code, "resource already exists", http.StatusConflict}
+	case Aborted:
+		return Public{code, "operation conflicted with a concurrent request", http.StatusConflict}
 	case FailedPrecondition:
 		return Public{code, "request precondition failed", http.StatusPreconditionFailed}
 	case ResourceExhausted:

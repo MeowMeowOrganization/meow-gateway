@@ -18,7 +18,7 @@ func TestToConnectSanitizesUpstreamErrors(t *testing.T) {
 		{connect.NewError(connect.CodePermissionDenied, errors.New("secret account ID")), connect.CodePermissionDenied},
 		{connect.NewError(connect.CodeUnavailable, errors.New("internal DNS host")), connect.CodeUnavailable},
 		{connect.NewError(connect.CodeUnknown, errors.New("stack trace secret")), connect.CodeInternal},
-		{connect.NewError(connect.CodeAborted, errors.New("postgres conflict")), connect.CodeInternal},
+		{connect.NewError(connect.CodeAborted, errors.New("postgres conflict")), connect.CodeAborted},
 		{errors.New("internal panic SQL key"), connect.CodeInternal},
 		{New(InvalidArgument, errors.New("user payload secret")), connect.CodeInvalidArgument},
 		{context.Canceled, connect.CodeCanceled},
@@ -37,5 +37,16 @@ func TestToConnectSanitizesUpstreamErrors(t *testing.T) {
 	}
 	if err := ToConnect(nil); err != nil {
 		t.Fatal("nil must stay nil")
+	}
+}
+
+func TestAbortedPreservesRetryableConflictWithoutLeakingCause(t *testing.T) {
+	upstream := connect.NewError(connect.CodeAborted, errors.New("private transaction details"))
+	err := ToConnect(upstream)
+	if connect.CodeOf(err) != connect.CodeAborted || strings.Contains(err.Error(), "private transaction") {
+		t.Fatalf("incorrect aborted mapping: %v", err)
+	}
+	if got := Map(New(Aborted, upstream)); got.HTTPStatus != 409 {
+		t.Fatalf("aborted HTTP mapping: %+v", got)
 	}
 }
