@@ -26,6 +26,9 @@ func New(readHeaderTimeout time.Duration, logger *slog.Logger, middlewares ...mi
 	s.http = &http.Server{
 		Handler:           s.handler,
 		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		MaxHeaderBytes:    64 << 10,
 		IdleTimeout:       60 * time.Second,
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
 	}

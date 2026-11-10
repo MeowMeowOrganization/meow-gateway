@@ -1,5 +1,5 @@
-// Package auth defines the trusted account identity boundary. It deliberately
-// does not implement a JWT validator, token issuer, or database lookup.
+// Package auth defines the trusted account identity boundary. It does not
+// issue tokens, implement browser sessions, or accept identity headers.
 package auth
 
 import (
@@ -13,7 +13,20 @@ import (
 
 // Principal contains identity derived from verified credentials, never from
 // X-Account-ID or any other client-supplied identity header.
-type Principal struct{ AccountID string }
+type Principal struct {
+	AccountID   string
+	SubjectID   string
+	Permissions []Permission
+}
+
+func (p Principal) HasPermission(required Permission) bool {
+	for _, permission := range p.Permissions {
+		if permission == required {
+			return true
+		}
+	}
+	return false
+}
 
 // Verifier MUST verify credential signature/validity and resolve its account.
 // Return ErrInvalidCredentials for invalid credentials; other errors signify
@@ -23,6 +36,7 @@ type Verifier interface {
 }
 
 var ErrInvalidCredentials = errors.New("invalid credentials")
+var ErrCSRF = errors.New("CSRF validation failed")
 var ErrInvalidPrincipal = errors.New("invalid verified principal")
 
 type principalKey struct{}
@@ -40,6 +54,18 @@ func WithPrincipal(ctx context.Context, principal Principal) (context.Context, e
 			return nil, ErrInvalidPrincipal
 		}
 	}
+	if principal.SubjectID != "" && (len(principal.SubjectID) > 128 || !safeIdentifier(principal.SubjectID)) {
+		return nil, ErrInvalidPrincipal
+	}
+	seen := map[Permission]bool{}
+	for _, permission := range principal.Permissions {
+		if !validPermission(permission) || seen[permission] {
+			return nil, ErrInvalidPrincipal
+		}
+		seen[permission] = true
+	}
+	// Defensive copy: a caller must not be able to change grants in context.
+	principal.Permissions = append([]Permission(nil), principal.Permissions...)
 	return context.WithValue(ctx, principalKey{}, principal), nil
 }
 
@@ -97,4 +123,52 @@ func bearerToken(values []string) (string, bool) {
 		}
 	}
 	return parts[1], true
+}
+
+// CookieVerifier is intentionally distinct from Verifier: browser requests
+// require cookie/session validation and Origin + CSRF on state-changing calls.
+type CookieVerifier interface {
+	VerifyRequest(*http.Request) (Principal, error)
+}
+
+// BearerOrSession preserves API-key authentication and only falls back to a
+// browser session when Authorization is completely absent. An invalid bearer
+// NEVER falls back to an existing browser cookie.
+func BearerOrSession(verifier Verifier, cookies CookieVerifier) func(http.Handler) http.Handler {
+	if verifier == nil || cookies == nil {
+		panic("auth.BearerOrSession: nil verifier")
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var principal Principal
+			var err error
+			if len(r.Header.Values("Authorization")) != 0 {
+				token, ok := bearerToken(r.Header.Values("Authorization"))
+				if !ok {
+					err = ErrInvalidCredentials
+				} else {
+					principal, err = verifier.Verify(r.Context(), token)
+				}
+			} else {
+				principal, err = cookies.VerifyRequest(r)
+			}
+			if err != nil {
+				switch {
+				case errors.Is(err, ErrInvalidCredentials):
+					edgeerrors.WriteHTTP(w, edgeerrors.New(edgeerrors.Unauthenticated, err))
+				case errors.Is(err, ErrCSRF):
+					edgeerrors.WriteHTTP(w, edgeerrors.New(edgeerrors.PermissionDenied, err))
+				default:
+					edgeerrors.WriteHTTP(w, err)
+				}
+				return
+			}
+			ctx, err := WithPrincipal(r.Context(), principal)
+			if err != nil {
+				edgeerrors.WriteHTTP(w, err)
+				return
+			}
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
 }

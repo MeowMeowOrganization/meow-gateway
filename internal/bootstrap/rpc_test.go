@@ -25,7 +25,7 @@ type verifierFake struct{}
 
 func (verifierFake) Verify(_ context.Context, token string) (auth.Principal, error) {
 	if token == "valid-token" {
-		return auth.Principal{AccountID: "trusted-42"}, nil
+		return auth.Principal{AccountID: "trusted-42", SubjectID: "test-subject", Permissions: []auth.Permission{auth.OrdersRead, auth.OrdersWrite}}, nil
 	}
 	return auth.Principal{}, auth.ErrInvalidCredentials
 }

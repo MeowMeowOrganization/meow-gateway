@@ -140,3 +140,30 @@ func TestOrderServiceConfig(t *testing.T) {
 		}
 	}
 }
+
+func TestAuthConfigLimitsAndPath(t *testing.T) {
+	cfg, err := load(lookupFrom(map[string]string{
+		"GATEWAY_AUTH_CREDENTIALS_FILE":     "/tmp/gateway-keys.json",
+		"GATEWAY_IP_REQUESTS_PER_MINUTE":    "200",
+		"GATEWAY_ACCOUNT_READS_PER_MINUTE":  "80",
+		"GATEWAY_ACCOUNT_WRITES_PER_MINUTE": "15",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Auth.CredentialsFile != "/tmp/gateway-keys.json" || cfg.Auth.IPRequestsPerMinute != 200 ||
+		cfg.Auth.AccountReadsPerMinute != 80 || cfg.Auth.AccountWritesPerMinute != 15 {
+		t.Fatalf("unexpected auth config: %+v", cfg.Auth)
+	}
+	for _, bad := range []struct{ key, value string }{
+		{"GATEWAY_AUTH_CREDENTIALS_FILE", "  /tmp/keys.json"},
+		{"GATEWAY_IP_REQUESTS_PER_MINUTE", "0"},
+		{"GATEWAY_IP_REQUESTS_PER_MINUTE", "100001"},
+		{"GATEWAY_ACCOUNT_READS_PER_MINUTE", "-1"},
+		{"GATEWAY_ACCOUNT_WRITES_PER_MINUTE", "abc"},
+	} {
+		if _, err := load(lookupFrom(map[string]string{bad.key: bad.value})); err == nil {
+			t.Fatalf("invalid %s=%q accepted", bad.key, bad.value)
+		}
+	}
+}

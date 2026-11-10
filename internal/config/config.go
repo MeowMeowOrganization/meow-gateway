@@ -13,8 +13,31 @@ import (
 
 // Config contains configuration that is actively used by the gateway.
 type Config struct {
-	HTTP HTTPConfig
-	Log  LogConfig
+	HTTP    HTTPConfig
+	Auth    AuthConfig
+	Browser BrowserConfig
+	Log     LogConfig
+}
+
+type AuthConfig struct {
+	// Optional JSON registry of SHA-256 hashes of 256-bit opaque API tokens.
+	// Without it, trading stays fail-closed under DenyAll.
+	CredentialsFile        string
+	IPRequestsPerMinute    int
+	AccountReadsPerMinute  int
+	AccountWritesPerMinute int
+}
+
+// BrowserConfig enables server-side OIDC login and PostgreSQL sessions.
+// Disabled by default. Secrets must be injected by a secret manager, not Git.
+type BrowserConfig struct {
+	Enabled               bool
+	PublicOrigin          string
+	OIDCIssuer            string
+	ClientID              string
+	ClientSecret          string
+	DatabaseURL           string
+	AllowInsecureLoopback bool
 }
 
 type HTTPConfig struct {
@@ -47,11 +70,16 @@ type LogConfig struct {
 func Defaults() Config {
 	return Config{
 		HTTP: HTTPConfig{
-			Addr:                ":8080",
+			Addr:                "127.0.0.1:8080",
 			ReadHeaderTimeout:   5 * time.Second,
 			ShutdownTimeout:     15 * time.Second,
 			MaxRequestBodyBytes: 1 << 20,
 			OrderServiceTimeout: 5 * time.Second,
+		},
+		Auth: AuthConfig{
+			IPRequestsPerMinute:    120,
+			AccountReadsPerMinute:  120,
+			AccountWritesPerMinute: 30,
 		},
 		Log: LogConfig{
 			Level:  slog.LevelInfo,
@@ -109,6 +137,54 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 		}
 		cfg.HTTP.OrderServiceTimeout = valueDuration
 	}
+	for _, item := range []struct {
+		name string
+		dest *string
+	}{
+		{"GATEWAY_BROWSER_PUBLIC_ORIGIN", &cfg.Browser.PublicOrigin},
+		{"GATEWAY_OIDC_ISSUER", &cfg.Browser.OIDCIssuer},
+		{"GATEWAY_OIDC_CLIENT_ID", &cfg.Browser.ClientID},
+		{"GATEWAY_OIDC_CLIENT_SECRET", &cfg.Browser.ClientSecret},
+		{"GATEWAY_IDENTITY_DATABASE_URL", &cfg.Browser.DatabaseURL},
+	} {
+		if v, ok := lookup(item.name); ok {
+			*item.dest = v
+		}
+	}
+	for _, item := range []struct {
+		name string
+		dest *bool
+	}{
+		{"GATEWAY_BROWSER_ENABLED", &cfg.Browser.Enabled},
+		{"GATEWAY_BROWSER_ALLOW_INSECURE_LOOPBACK", &cfg.Browser.AllowInsecureLoopback},
+	} {
+		if v, ok := lookup(item.name); ok {
+			parsed, err := strconv.ParseBool(v)
+			if err != nil {
+				return Config{}, fmt.Errorf("%s: invalid boolean", item.name)
+			}
+			*item.dest = parsed
+		}
+	}
+	if value, ok := lookup("GATEWAY_AUTH_CREDENTIALS_FILE"); ok {
+		cfg.Auth.CredentialsFile = value
+	}
+	for _, item := range []struct {
+		name string
+		dest *int
+	}{
+		{"GATEWAY_IP_REQUESTS_PER_MINUTE", &cfg.Auth.IPRequestsPerMinute},
+		{"GATEWAY_ACCOUNT_READS_PER_MINUTE", &cfg.Auth.AccountReadsPerMinute},
+		{"GATEWAY_ACCOUNT_WRITES_PER_MINUTE", &cfg.Auth.AccountWritesPerMinute},
+	} {
+		if value, ok := lookup(item.name); ok {
+			parsed, err := strconv.Atoi(value)
+			if err != nil {
+				return Config{}, fmt.Errorf("%s: %w", item.name, err)
+			}
+			*item.dest = parsed
+		}
+	}
 	if value, ok := lookup("GATEWAY_LOG_LEVEL"); ok {
 		switch strings.ToLower(strings.TrimSpace(value)) {
 		case "debug":
@@ -133,6 +209,23 @@ func load(lookup func(string) (string, bool)) (Config, error) {
 }
 
 func (c Config) Validate() error {
+	if err := validateBrowser(c.Browser); err != nil {
+		return err
+	}
+
+	if c.Auth.CredentialsFile != "" && (strings.TrimSpace(c.Auth.CredentialsFile) != c.Auth.CredentialsFile ||
+		strings.ContainsAny(c.Auth.CredentialsFile, "\r\n")) {
+		return fmt.Errorf("GATEWAY_AUTH_CREDENTIALS_FILE: invalid path")
+	}
+	if c.Auth.IPRequestsPerMinute < 1 || c.Auth.IPRequestsPerMinute > 100000 {
+		return fmt.Errorf("GATEWAY_IP_REQUESTS_PER_MINUTE: expected 1..100000")
+	}
+	if c.Auth.AccountReadsPerMinute < 1 || c.Auth.AccountReadsPerMinute > 100000 {
+		return fmt.Errorf("GATEWAY_ACCOUNT_READS_PER_MINUTE: expected 1..100000")
+	}
+	if c.Auth.AccountWritesPerMinute < 1 || c.Auth.AccountWritesPerMinute > 100000 {
+		return fmt.Errorf("GATEWAY_ACCOUNT_WRITES_PER_MINUTE: expected 1..100000")
+	}
 	if c.HTTP.Addr == "" || strings.TrimSpace(c.HTTP.Addr) != c.HTTP.Addr {
 		return fmt.Errorf("GATEWAY_HTTP_ADDR: must be a non-empty host:port address without surrounding whitespace")
 	}
@@ -211,4 +304,43 @@ func validateUpstreamURL(raw string) error {
 		return fmt.Errorf("expected an http(s)://host[:port] base URL without path or credentials")
 	}
 	return nil
+}
+
+func validateBrowser(c BrowserConfig) error {
+	if !c.Enabled {
+		if c.PublicOrigin != "" || c.OIDCIssuer != "" || c.ClientID != "" || c.ClientSecret != "" || c.DatabaseURL != "" || c.AllowInsecureLoopback {
+			return fmt.Errorf("GATEWAY_BROWSER_ENABLED: must be true when browser OIDC settings are supplied")
+		}
+		return nil
+	}
+	if c.ClientID == "" || c.ClientSecret == "" || c.DatabaseURL == "" || c.PublicOrigin == "" || c.OIDCIssuer == "" {
+		return fmt.Errorf("GATEWAY_BROWSER_ENABLED: requires public origin, OIDC issuer/client id/client secret and identity database URL")
+	}
+	if len(c.ClientSecret) > 4096 || len(c.ClientID) > 256 {
+		return fmt.Errorf("GATEWAY_OIDC_CLIENT_ID/SECRET: invalid length")
+	}
+	if err := validateOrigin(c.PublicOrigin); err != nil {
+		return fmt.Errorf("GATEWAY_BROWSER_PUBLIC_ORIGIN: %w", err)
+	}
+	u, _ := url.Parse(c.PublicOrigin)
+	if u.Scheme != "https" && !(c.AllowInsecureLoopback && isLoopbackHost(u.Hostname())) {
+		return fmt.Errorf("GATEWAY_BROWSER_PUBLIC_ORIGIN: HTTPS required except explicit loopback development")
+	}
+	provider, err := url.Parse(c.OIDCIssuer)
+	if err != nil || provider == nil || provider.Hostname() == "" || provider.User != nil || provider.Opaque != "" || provider.RawQuery != "" || provider.Fragment != "" ||
+		(provider.Scheme != "https" && !(c.AllowInsecureLoopback && provider.Scheme == "http" && isLoopbackHost(provider.Hostname()))) || provider.String() != c.OIDCIssuer {
+		return fmt.Errorf("GATEWAY_OIDC_ISSUER: invalid issuer URL")
+	}
+	database, err := url.Parse(c.DatabaseURL)
+	if err != nil || database == nil || (database.Scheme != "postgres" && database.Scheme != "postgresql") || database.Hostname() == "" || database.Path == "" {
+		return fmt.Errorf("GATEWAY_IDENTITY_DATABASE_URL: expected postgres://user:pass@host/dbname")
+	}
+	return nil
+}
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

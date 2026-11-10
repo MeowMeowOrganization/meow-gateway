@@ -3,3 +3,9 @@ bin/
 coverage.out
 *.test
 .DS_Store
+
+# Local secrets, credentials and database configuration.
+local-auth-keys*.json
+*.local
+*.secret
+go.isolated.mod
